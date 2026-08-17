@@ -1,23 +1,26 @@
 from .base_connector import BaseConnector
 
+from configs.settings import TAVILY_HEADERS
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 import hashlib
 import html
+import math
 import re
+import unicodedata
 import socket
 import ipaddress
+import os
 
 import requests
 import trafilatura
 
 
 class WebScraperConnector(BaseConnector):
-    """Search top URLs with DuckDuckGo, then crawl/extract them with Trafilatura."""
+    """Search top URLs with Tavily, then crawl/extract them with Trafilatura."""
 
-    DDG_HTML = "https://html.duckduckgo.com/html/"
-    DDG_LITE = "https://lite.duckduckgo.com/lite/"
-    GOOGLE_SEARCH = "https://www.google.com/search"
+    TAVILY_SEARCH = "https://api.tavily.com/search"
 
     SEARCH_TIMEOUT = 15
     MAX_URLS = 10
@@ -32,7 +35,6 @@ class WebScraperConnector(BaseConnector):
         ),
         "Accept": "text/html,application/xhtml+xml",
         "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://html.duckduckgo.com/",
     }
 
     BAD_TEXT = (
@@ -42,12 +44,6 @@ class WebScraperConnector(BaseConnector):
         "checking your browser",
         "just a moment",
         "request blocked",
-    )
-
-    DDG_ANTIBOT_TEXT = (
-        "unfortunately, bots use duckduckgo too",
-        "please complete the following challenge",
-        "select all squares containing a duck",
     )
 
     @property
@@ -121,226 +117,294 @@ class WebScraperConnector(BaseConnector):
     # ------------------------------------------------------------------
 
     @classmethod
-    def _unwrap_search_url(cls, href):
-        if not href:
-            return ""
+    def web_search(cls, query):
+        if not TAVILY_HEADERS:
+            return {
+                "ok": False,
+                "urls": [],
+                "backend": None,
+                "errors": ["TAVILY_API_KEY/HEADERS is not set"],
+            }
 
-        href = html.unescape(href.strip())
-        p = urlparse(href)
-        params = dict(parse_qsl(p.query, keep_blank_values=True))
-
-        if params.get("uddg"):
-            href = unquote(params["uddg"])
-
-        return cls._safe_url(href)
-
-    @classmethod
-    def _parse_search(cls, body):
-        from bs4 import BeautifulSoup
-
-        soup = BeautifulSoup(body, "html.parser")
-        candidates = []
-
-        # Preferred DDG layouts.
-        selectors = (
-            "#links div.web-result h2 a",
-            "#links .result__a",
-            "a.result__a",
-            'a[data-testid="result-title-a"]',
-            "a.result-link",
-        )
-
-        for selector in selectors:
-            for tag in soup.select(selector):
-                url = cls._unwrap_search_url(tag.get("href"))
-                title = tag.get_text(" ", strip=True)
-                if url:
-                    candidates.append({"url": url, "title": title})
-            if candidates:
-                break
-
-        # Broad fallback: useful when DDG changes classes/markup.
-        if not candidates:
-            root = soup.select_one("#links") or soup.body or soup
-            for tag in root.find_all("a", href=True):
-                url = cls._unwrap_search_url(tag.get("href"))
-                title = tag.get_text(" ", strip=True)
-                if url and title:
-                    candidates.append({"url": url, "title": title})
-
-        unique = {}
-        for item in candidates:
-            unique.setdefault(item["url"], item)
-
-        return list(unique.values())[: cls.MAX_URLS]
-
-    @classmethod
-    def _search_once(cls, endpoint, query):
         try:
             response = requests.post(
-                endpoint,
-                data={"q": query, "b": "", "kl": "us-en"},
-                headers=cls.HEADERS,
+                cls.TAVILY_SEARCH,
+                json={
+                    "query": query,
+                    "search_depth": "basic",
+                    "max_results": cls.MAX_URLS,
+                    "include_answer": False,
+                    "include_raw_content": False,
+                    "include_images": False,
+                },
+                headers=TAVILY_HEADERS,
                 timeout=cls.SEARCH_TIMEOUT,
             )
 
             if not 200 <= response.status_code < 300:
-                return [], f"{endpoint}: HTTP {response.status_code}"
+                try:
+                    detail = response.json().get("detail")
+                    if isinstance(detail, dict):
+                        detail = detail.get("error")
+                except ValueError:
+                    detail = None
 
-            body = response.content
-            lower = body.decode("utf-8", errors="replace").lower()[:50_000]
+                error = f"Tavily: HTTP {response.status_code}"
+                if detail:
+                    error += f": {detail}"
 
-            if any(marker in lower for marker in cls.BAD_TEXT):
-                return [], f"{endpoint}: challenge/block page"
+                return {
+                    "ok": False,
+                    "urls": [],
+                    "backend": "tavily",
+                    "errors": [error],
+                }
 
-            urls = cls._parse_search(body)
-            if urls:
-                return urls, None
-
-            return [], f"{endpoint}: no usable URLs"
-
-        except requests.RequestException as exc:
-            return [], f"{endpoint}: {exc}"
-
-    @classmethod
-    def _search_google(cls, query):
-        try:
-            response = requests.get(
-                cls.GOOGLE_SEARCH,
-                params={"q": query, "num": cls.MAX_URLS, "hl": "en"},
-                headers=cls.HEADERS,
-                timeout=cls.SEARCH_TIMEOUT,
-            )
-
-            if not 200 <= response.status_code < 300:
-                return [], f"{cls.GOOGLE_SEARCH}: HTTP {response.status_code}"
-
-            body = response.content
-            lower = body.decode("utf-8", errors="replace").lower()[:80_000]
-
-            google_block_markers = cls.BAD_TEXT + (
-                "unusual traffic from your computer network",
-                "our systems have detected unusual traffic",
-                "sorry, we couldn't find any results",
-            )
-            if any(marker in lower for marker in google_block_markers):
-                return [], f"{cls.GOOGLE_SEARCH}: challenge/block page"
-
-            from bs4 import BeautifulSoup
-
-            soup = BeautifulSoup(body, "html.parser")
+            data = response.json()
             candidates = []
 
-            # Google result titles are commonly contained in <h3> elements
-            # whose parent <a> points to the actual result URL.
-            for heading in soup.find_all("h3"):
-                parent = heading.find_parent("a", href=True)
-                if not parent:
+            for result in data.get("results", []):
+                url = cls._safe_url(result.get("url"))
+                if not url:
                     continue
 
-                url = cls._unwrap_search_url(parent.get("href"))
-                title = heading.get_text(" ", strip=True)
-                if url and title:
-                    candidates.append({"url": url, "title": title})
-
-            # Broader Google fallback for markup changes.
-            if not candidates:
-                for tag in soup.select('a[href]'):
-                    href = tag.get("href", "")
-                    url = cls._unwrap_search_url(href)
-                    title = tag.get_text(" ", strip=True)
-                    if url and title and "google." not in (urlparse(url).hostname or "").lower():
-                        candidates.append({"url": url, "title": title})
+                candidates.append({
+                    "url": url,
+                    "title": (result.get("title") or "").strip(),
+                })
 
             unique = {}
             for item in candidates:
                 unique.setdefault(item["url"], item)
 
             urls = list(unique.values())[: cls.MAX_URLS]
-            if urls:
-                return urls, None
 
-            return [], f"{cls.GOOGLE_SEARCH}: no usable URLs"
-
-        except requests.RequestException as exc:
-            return [], f"{cls.GOOGLE_SEARCH}: {exc}"
-        except Exception as exc:
-            return [], f"{cls.GOOGLE_SEARCH}: {type(exc).__name__}: {exc}"
-
-    @classmethod
-    def _is_ddg_antibot(cls, error):
-        error = str(error or "").lower()
-        return "challenge/block page" in error or any(
-            marker in error for marker in cls.DDG_ANTIBOT_TEXT
-        )
-
-    @classmethod
-    def web_search(cls, query):
-        errors = []
-        ddg_antibot = False
-
-        for endpoint in (cls.DDG_HTML, cls.DDG_LITE):
-            urls, error = cls._search_once(endpoint, query)
             if urls:
                 return {
                     "ok": True,
                     "urls": urls,
-                    "backend": endpoint,
-                    "errors": errors,
+                    "backend": "tavily",
+                    "errors": [],
                 }
 
-            errors.append(error)
-            if cls._is_ddg_antibot(error):
-                ddg_antibot = True
-
-        # Only invoke the fallback when DDG actually returned an anti-bot
-        # challenge. This avoids changing the existing DDG behavior for
-        # ordinary network errors or markup/search failures.
-        if ddg_antibot:
-            google_urls, google_error = cls._search_google(query)
-            if google_urls:
-                return {
-                    "ok": True,
-                    "urls": google_urls,
-                    "backend": cls.GOOGLE_SEARCH,
-                    "errors": errors,
-                }
-
-            # Required connector-level exception for a failed fallback.
             return {
                 "ok": False,
                 "urls": [],
-                "backend": None,
-                "errors": ["anit-bot page"],
+                "backend": "tavily",
+                "errors": ["Tavily: no usable URLs"],
             }
 
-        return {
-            "ok": False,
-            "urls": [],
-            "backend": None,
-            "errors": errors,
-        }
+        except (requests.RequestException, ValueError) as exc:
+            return {
+                "ok": False,
+                "urls": [],
+                "backend": "tavily",
+                "errors": [f"Tavily: {type(exc).__name__}: {exc}"],
+            }
 
     # ------------------------------------------------------------------
     # Crawl / extraction
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Content cleaning / corruption filtering
+    # ------------------------------------------------------------------
+
+    # These limits are intentionally conservative: the cleaner removes
+    # obviously machine-generated/corrupt payloads while leaving normal
+    # prose, code snippets, hashes, URLs, equations, and tables alone.
+    MAX_SUSPICIOUS_BLOCK_RATIO = 0.45
+    MAX_REPLACEMENT_RATIO = 0.015
+    MIN_BLOB_LENGTH = 180
+    MIN_ENTROPY_LENGTH = 160
+
     @staticmethod
-    def _clean_text(text):
+    def _entropy(value):
+        if not value:
+            return 0.0
+        counts = {}
+        for char in value:
+            counts[char] = counts.get(char, 0) + 1
+        length = len(value)
+        return -sum(
+            (count / length) * math.log2(count / length)
+            for count in counts.values()
+            if count
+        )
+
+    @classmethod
+    def _suspicion_score(cls, block):
+        """Score a text block for binary/encrypted/encoded corruption.
+
+        This deliberately scores blocks rather than the whole document so a
+        page containing one bad payload can still return its useful prose.
+        """
+        if not block:
+            return 0.0
+
+        length = len(block)
+        stripped = re.sub(r"\s+", "", block)
+
+        controls = sum(
+            1
+            for char in block
+            if unicodedata.category(char).startswith("C")
+            and char not in "\n\t\r"
+        )
+        replacements = block.count("\ufffd")
+        non_printable = sum(
+            1
+            for char in block
+            if not char.isprintable() and char not in "\n\t\r"
+        )
+
+        score = 0.0
+        score += min(0.55, (controls / max(length, 1)) * 5.0)
+        score += min(0.35, (non_printable / max(length, 1)) * 4.0)
+        score += min(0.30, (replacements / max(length, 1)) * 12.0)
+
+        # Long, whitespace-free base64/hex payloads are common symptoms of
+        # encrypted/binary responses accidentally exposed as extracted text.
+        if len(stripped) >= cls.MIN_BLOB_LENGTH:
+            base64ish = bool(
+                re.fullmatch(r"[A-Za-z0-9+/=_-]+", stripped)
+                and len(stripped) % 4 in {0, 2, 3}
+            )
+            hexish = bool(
+                re.fullmatch(r"[0-9A-Fa-f]+", stripped)
+                and len(stripped) % 2 == 0
+            )
+
+            if base64ish:
+                score += 0.90
+            if hexish:
+                score += 0.90
+
+            # High entropy + very low natural-language structure is another
+            # strong indicator, but entropy alone is never enough to delete.
+            if len(stripped) >= cls.MIN_ENTROPY_LENGTH:
+                entropy = cls._entropy(stripped)
+                word_count = len(re.findall(r"\b[\w'-]{2,}\b", block))
+                whitespace_ratio = sum(c.isspace() for c in block) / length
+                if entropy >= 4.5 and word_count <= 8 and whitespace_ratio < 0.08:
+                    score += 0.55
+
+        # Typical mojibake markers from a wrong character decoding.
+        mojibake = len(re.findall(r"[ÃÂâ€š€™œž]", block))
+        if mojibake >= 4:
+            score += min(0.35, mojibake / max(length, 1) * 10.0)
+
+        return min(score, 1.0)
+
+    @classmethod
+    def _clean_text(cls, text):
+        """Normalize extracted text and remove strongly corrupted blocks."""
         text = html.unescape(text or "")
-        text = text.replace("\xa0", " ")
-        text = re.sub(r"[ \t\r\f\v]+", " ", text)
-        text = re.sub(r"\n\s*\n+", "\n\n", text)
+        text = unicodedata.normalize("NFKC", text)
+        text = text.replace("\xa0", " ").replace("\u200b", "")
+
+        # Strip NUL/control characters while preserving normal whitespace.
+        text = "".join(
+            char
+            for char in text
+            if char in "\n\r\t"
+            or not unicodedata.category(char).startswith("C")
+        )
+
+        # Normalize line endings before block-level filtering.
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        raw_blocks = re.split(r"\n\s*\n+", text)
+
+        kept_blocks = []
+        suspicious_chars = 0
+        total_chars = max(len(text), 1)
+
+        for block in raw_blocks:
+            block = block.strip()
+            if not block:
+                continue
+
+            suspicious = cls._suspicion_score(block)
+
+            # Remove only strongly suspicious blocks. This is deliberately
+            # stricter for long payloads and more permissive for short text.
+            if suspicious >= 0.78 and len(block) >= 120:
+                continue
+
+            # For a block that contains mostly ordinary prose plus a corrupt
+            # line, filter suspicious individual lines instead of discarding
+            # the entire block.
+            if suspicious >= 0.48:
+                lines = []
+                for line in block.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    line_score = cls._suspicion_score(line)
+                    if line_score < 0.78 or len(line) < 120:
+                        lines.append(line)
+                    else:
+                        suspicious_chars += len(line)
+                block = "\n".join(lines).strip()
+                if not block:
+                    continue
+
+            suspicious_chars += sum(
+                1
+                for char in block
+                if char == "\ufffd"
+                or (
+                    not char.isprintable()
+                    and char not in "\n\t\r"
+                )
+            )
+            kept_blocks.append(block)
+
+        text = "\n\n".join(kept_blocks)
+
+        # Final whitespace cleanup. Do not flatten newlines: they carry useful
+        # structure for articles, lists, code, and tables.
+        text = re.sub(r"[ \t\f\v]+", " ", text)
+        text = re.sub(r" *\n *", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+
+        if suspicious_chars / total_chars > cls.MAX_REPLACEMENT_RATIO:
+            # The caller/quality gate will reject severely corrupted output.
+            pass
+
         return text.strip()
 
     @classmethod
     def _quality(cls, text):
-        text = cls._clean_text(text)
+        original = text or ""
+        text = cls._clean_text(original)
         if not text:
             return {"usable": False, "score": 0.0, "reason": "empty extraction"}
 
         words = re.findall(r"\b[\w'-]+\b", text.lower())
         unique_ratio = len(set(words)) / max(len(words), 1)
+
+        replacement_ratio = text.count("\ufffd") / max(len(text), 1)
+        suspicious_blocks = [
+            block for block in re.split(r"\n\s*\n+", text)
+            if cls._suspicion_score(block) >= 0.78
+        ]
+        suspicious_chars = sum(len(block) for block in suspicious_blocks)
+        suspicious_ratio = suspicious_chars / max(len(text), 1)
+
+        if replacement_ratio > cls.MAX_REPLACEMENT_RATIO:
+            return {
+                "usable": False,
+                "score": 0.0,
+                "reason": "text encoding appears corrupted",
+            }
+
+        if suspicious_ratio > cls.MAX_SUSPICIOUS_BLOCK_RATIO:
+            return {
+                "usable": False,
+                "score": 0.0,
+                "reason": "extraction appears to contain binary or encoded payload",
+            }
 
         if len(text) < 80:
             return {
@@ -351,7 +415,9 @@ class WebScraperConnector(BaseConnector):
 
         score = min(
             1.0,
-            0.55 + min(len(text) / 12_000, 1.0) * 0.30 + unique_ratio * 0.15,
+            0.55
+            + min(len(text) / 12_000, 1.0) * 0.30
+            + unique_ratio * 0.15,
         )
 
         return {

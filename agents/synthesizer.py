@@ -2,8 +2,8 @@ from services.time_thread import get_live_time
 #from integrations.open_router_client import OpenRouterClient
 from integrations.ollama_llm import OllamaModel
 
-#Client = OpenRouterClient()
-model = OllamaModel()
+#Client = OpenRouterClient() 
+model = OllamaModel(model="gemma4:cloud")
 
 with open("prompts/synthesizer_prompt.txt") as ins_file:
   synthesizer_prompt = ins_file.read()

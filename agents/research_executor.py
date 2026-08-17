@@ -13,7 +13,7 @@ available_connectors = [
     },
     {
         "name": "youtube_transcripts",
-        "description": "Find relevant YouTube videos and retrieve their transcripts."
+        "description": "given a query, the connector finds relevant YouTube videos and return their transcripts."
     },
     {
         "name": "research_papers",

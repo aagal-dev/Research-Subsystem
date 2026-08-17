@@ -4,9 +4,9 @@ from connectors.connector_registry import ConnectorRegistry
 # Connectors imports
 from connectors.github import GitHubConnector
 from connectors.news import NewsConnector
-from connectors.web_scraper_v3_fixed import WebScraperConnector
+from connectors.web_scraper_v3_tavily import WebScraperConnector
 from connectors.research_papers import ResearchPapersConnector
-from connectors.youtube import YouTubeConnector
+from connectors.youtube_connector_v1 import YouTubeConnector
 
 connector_registry = ConnectorRegistry()
     
